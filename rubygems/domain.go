@@ -1,77 +1,85 @@
+// Package rubygems exposes rubygems.org as a kit Domain.
+//
+// A multi-domain host (ant) enables it with a single blank import:
+//
+//	import _ "github.com/tamnd/rubygems-cli/rubygems"
+//
+// The same Domain also builds the standalone rubygems binary.
 package rubygems
 
 import (
 	"context"
-	"net/url"
-	"strings"
+	"time"
 
 	"github.com/tamnd/any-cli/kit"
 	"github.com/tamnd/any-cli/kit/errs"
 )
 
-// domain.go exposes rubygems as a kit Domain: a driver that a multi-domain
-// host (ant) enables with a single blank import,
-//
-//	import _ "github.com/tamnd/rubygems-cli/rubygems"
-//
-// exactly as a database/sql program enables a driver with `import _
-// "github.com/lib/pq"`. The init below registers it; the host then dereferences
-// rubygems:// URIs by routing to the operations Register installs. The same
-// Domain also builds the standalone rubygems binary (see cli.NewApp), so the
-// binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
 func init() { kit.Register(Domain{}) }
 
-// Domain is the rubygems driver. It carries no state; the per-run client is
-// built by the factory Register hands kit.
+// Domain is the rubygems driver.
 type Domain struct{}
 
-// Info describes the scheme, the hostnames a pasted link is matched against, and
-// the identity reused for the binary's help and version.
+// Info describes the scheme, hostnames, and binary identity.
 func (Domain) Info() kit.DomainInfo {
 	return kit.DomainInfo{
 		Scheme: "rubygems",
 		Hosts:  []string{Host},
 		Identity: kit.Identity{
 			Binary: "rubygems",
-			Short:  "A command line for rubygems.",
-			Long: `A command line for rubygems.
-
-rubygems reads public rubygems data over plain HTTPS, shapes it into
-clean records, and prints output that pipes into the rest of your tools. No API
-key, nothing to run alongside it.`,
+			Short:  "Ruby gem registry search and info (rubygems.org)",
+			Long: `rubygems fetches gem search results, gem info, and version history
+from the public RubyGems.org API. No API key required.`,
 			Site: Host,
 			Repo: "https://github.com/tamnd/rubygems-cli",
 		},
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
+// Register installs the client factory and operations onto app.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `rubygems page` and
-	// `ant get rubygems://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
+	// search: find gems matching a query
+	kit.Handle(app, kit.OpMeta{
+		Name:    "search",
+		Group:   "read",
+		List:    true,
+		Summary: "Search for Ruby gems",
+		Args:    []kit.Arg{{Name: "query", Help: "search query"}},
+	}, searchOp)
 
-	// List op: members of a page, the home of `rubygems links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// rubygems://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	// gem: fetch info for a single gem
+	kit.Handle(app, kit.OpMeta{
+		Name:    "gem",
+		Group:   "read",
+		Single:  true,
+		Summary: "Show info for a Ruby gem",
+		Args:    []kit.Arg{{Name: "name", Help: "gem name"}},
+	}, gemOp)
+
+	// versions: list versions of a gem
+	kit.Handle(app, kit.OpMeta{
+		Name:    "versions",
+		Group:   "read",
+		List:    true,
+		Summary: "List versions of a Ruby gem",
+		Args:    []kit.Arg{{Name: "name", Help: "gem name"}},
+	}, versionsOp)
+
+	// deps: list reverse dependencies
+	kit.Handle(app, kit.OpMeta{
+		Name:    "deps",
+		Group:   "read",
+		List:    true,
+		Summary: "List gems that depend on this gem (reverse dependencies)",
+		Args:    []kit.Arg{{Name: "name", Help: "gem name"}},
+	}, depsOp)
 }
 
-// newClient builds the client from the host-resolved config, so a host and the
-// standalone binary pace and identify themselves the same way.
+// newClient bridges kit.Config to Config.
 func newClient(_ context.Context, cfg kit.Config) (any, error) {
-	c := NewClient()
+	c := DefaultConfig()
 	if cfg.UserAgent != "" {
 		c.UserAgent = cfg.UserAgent
 	}
@@ -82,92 +90,121 @@ func newClient(_ context.Context, cfg kit.Config) (any, error) {
 		c.Retries = cfg.Retries
 	}
 	if cfg.Timeout > 0 {
-		c.HTTP.Timeout = cfg.Timeout
+		c.Timeout = cfg.Timeout
 	}
-	return c, nil
+	return NewClient(c), nil
 }
 
 // --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
 
-type pageRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
+type searchInput struct {
+	Query  string        `kit:"arg" help:"search query"`
+	Limit  int           `kit:"flag,inherit" help:"max results"`
+	Delay  time.Duration `kit:"flag,inherit" help:"minimum spacing between requests"`
+	Client *Client       `kit:"inject"`
+}
+
+type gemInput struct {
+	Name   string  `kit:"arg" help:"gem name"`
 	Client *Client `kit:"inject"`
 }
 
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Limit  int     `kit:"flag,inherit" help:"max results"`
-	Client *Client `kit:"inject"`
+type versionsInput struct {
+	Name   string        `kit:"arg" help:"gem name"`
+	Limit  int           `kit:"flag,inherit" help:"max results"`
+	Delay  time.Duration `kit:"flag,inherit" help:"minimum spacing between requests"`
+	Client *Client       `kit:"inject"`
+}
+
+type depsInput struct {
+	Name   string        `kit:"arg" help:"gem name"`
+	Limit  int           `kit:"flag,inherit" help:"max results"`
+	Delay  time.Duration `kit:"flag,inherit" help:"minimum spacing between requests"`
+	Client *Client       `kit:"inject"`
 }
 
 // --- handlers ---
 
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
+func searchOp(ctx context.Context, in searchInput, emit func(Gem) error) error {
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 10
+	}
+	items, err := in.Client.Search(ctx, in.Query, limit)
 	if err != nil {
 		return mapErr(err)
 	}
-	return emit(p)
-}
-
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
-	if err != nil {
-		return mapErr(err)
-	}
-	for _, p := range pages {
-		if err := emit(p); err != nil {
+	for _, item := range items {
+		if err := emit(item); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// --- Resolver: the URI-native string functions, pure and network-free ---
-
-// Classify turns any accepted input — a bare path or a full rubygems.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
-func (Domain) Classify(input string) (uriType, id string, err error) {
-	id = pagePath(input)
-	if id == "" {
-		return "", "", errs.Usage("unrecognized rubygems reference: %q", input)
+func gemOp(ctx context.Context, in gemInput, emit func(Gem) error) error {
+	g, err := in.Client.GemInfo(ctx, in.Name)
+	if err != nil {
+		return mapErr(err)
 	}
-	return "page", id, nil
+	return emit(g)
 }
 
-// Locate is the inverse: the live https URL for a (type, id).
+func versionsOp(ctx context.Context, in versionsInput, emit func(Version) error) error {
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 10
+	}
+	items, err := in.Client.Versions(ctx, in.Name, limit)
+	if err != nil {
+		return mapErr(err)
+	}
+	for _, item := range items {
+		if err := emit(item); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func depsOp(ctx context.Context, in depsInput, emit func(ReverseDep) error) error {
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 10
+	}
+	items, err := in.Client.ReverseDeps(ctx, in.Name, limit)
+	if err != nil {
+		return mapErr(err)
+	}
+	for _, item := range items {
+		if err := emit(item); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// --- Resolver ---
+
+// Classify maps a gem name to (type, id).
+func (Domain) Classify(input string) (uriType, id string, err error) {
+	if input == "" {
+		return "", "", errs.Usage("empty rubygems reference")
+	}
+	return "gem", input, nil
+}
+
+// Locate returns the rubygems.org page URL for a (type, id).
 func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
+	switch uriType {
+	case "gem":
+		return "https://rubygems.org/gems/" + id, nil
+	default:
 		return "", errs.Usage("rubygems has no resource type %q", uriType)
 	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
 }
 
-// --- helpers ---
-
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
-func pagePath(input string) string {
-	input = strings.TrimSpace(input)
-	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		return strings.Trim(u.Path, "/")
-	}
-	return strings.Trim(input, "/")
-}
-
-// mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
+// mapErr converts a library error into a kit error kind.
 func mapErr(err error) error {
 	return err
 }
